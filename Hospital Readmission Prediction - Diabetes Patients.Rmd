@@ -1,0 +1,504 @@
+---
+title: "Hospital Readmission Prediction - Diabetes Patients"
+author: "Noelia Caba Martin"
+date: "2026-03-19"
+output: html_document
+---
+
+## Introduction
+**The goal of this project is to identify patients at high risk of 
+30-day readmission in order to support early intervention strategies, 
+reduce healthcare costs, and improve patient outcomes.**
+Hospital readmission — when a patient is discharged and returns within 
+30 days — is a major challenge in healthcare. It indicates inadequate 
+recovery, increases healthcare costs, and is associated with worse 
+patient outcomes.
+
+In the United States, the Centers for Medicare & Medicaid Services (CMS) 
+penalizes hospitals with high readmission rates, making prediction of 
+at-risk patients a high-priority clinical and business problem.
+
+**Why diabetes patients?**
+Diabetic patients have particularly high readmission rates due to:
+- Complexity of disease management
+- Multiple comorbidities
+- Medication adjustments during hospitalization
+
+**Research question:** Can we predict 30-day hospital readmission in 
+diabetic patients from clinical and administrative data?
+
+The main objectives are:
+
+- Perform comprehensive data cleaning of real hospital records
+- Engineer clinically meaningful features
+- Build a predictive model for 30-day readmission
+- Evaluate model performance with appropriate metrics
+- Identify key clinical predictors of readmission
+
+## Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+```{r libraries}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(pROC)
+library(MLmetrics)
+library(ggplot2)
+library(corrplot)
+```
+
+## Data Loading and Initial Exploration
+```{r load-data}
+# Load dataset
+hospital <- read.csv("diabetic_data.csv", 
+                     stringsAsFactors = FALSE,
+                     na.strings = c("?", "Unknown", ""))
+
+# Initial exploration
+dim(hospital)
+str(hospital)
+head(hospital, 3)
+```
+
+The dataset contains **101,766 hospital encounters** and **50 variables** 
+covering patient demographics, clinical measurements, diagnoses and 
+medications.
+
+Key observations:
+
+- **`readmitted`** has three levels: `NO`, `<30` (readmitted within 
+30 days) and `>30` (readmitted after 30 days). For this analysis, 
+we define the outcome as **readmission within 30 days** (`<30` = Yes, 
+all others = No)
+- **`weight`** has extensive missing data and will be removed
+- **`age`** is coded as ranges and requires recoding
+- **23 medication variables** are coded as No/Steady/Up/Down
+
+## Data Cleaning
+
+This dataset requires extensive cleaning due to its real-world clinical 
+origin. Key steps include:
+
+1. **Remove irrelevant variables** — IDs, variables with excessive missingness
+2. **Create binary outcome** — readmission within 30 days
+3. **Recode age** — convert ranges to numeric midpoints
+4. **Handle medications** — simplify to binary (changed vs not changed)
+5. **Remove duplicate patients** — keep only first encounter per patient
+6. **Filter invalid records** — remove deceased/hospice patients
+
+```{r data-cleaning}
+hospital_clean <- hospital %>%
+  
+  # Remove variables with excessive missingness or irrelevant
+  select(-weight, -payer_code, -encounter_id) %>%
+  
+  # Keep only first encounter per patient
+  distinct(patient_nbr, .keep_all = TRUE) %>%
+  select(-patient_nbr) %>%
+  
+  # Remove patients discharged to hospice or who died
+  filter(!discharge_disposition_id %in% c(11, 13, 14, 19, 20, 21)) %>%
+  
+  # Create binary outcome: readmitted within 30 days
+  mutate(readmitted_30 = ifelse(readmitted == "<30", "Yes", "No")) %>%
+  mutate(readmitted_30 = as.factor(readmitted_30)) %>%
+  select(-readmitted) %>%
+  
+  # Recode age to numeric midpoints
+  mutate(age = case_when(
+    age == "[0-10)"  ~ 5,
+    age == "[10-20)" ~ 15,
+    age == "[20-30)" ~ 25,
+    age == "[30-40)" ~ 35,
+    age == "[40-50)" ~ 45,
+    age == "[50-60)" ~ 55,
+    age == "[60-70)" ~ 65,
+    age == "[70-80)" ~ 75,
+    age == "[80-90)" ~ 85,
+    age == "[90-100)" ~ 95
+  )) %>%
+  
+  # Simplify medication variables to binary
+  mutate(across(c(metformin, insulin, glipizide, glyburide,
+                  pioglitazone, rosiglitazone),
+                ~ifelse(. == "No", 0, 1))) %>%
+  
+  # Convert gender to binary
+  mutate(gender = ifelse(gender == "Male", 1, 0)) %>%
+  
+  # Remove remaining character variables except race
+  select(where(is.numeric), race, medical_specialty,
+         change, diabetesMed, A1Cresult, readmitted_30) %>%
+  
+  mutate(medical_specialty = as.factor(medical_specialty),
+       race = as.factor(race),
+       change = as.factor(change),
+       diabetesMed = as.factor(diabetesMed),
+       A1Cresult = as.factor(A1Cresult)) %>%
+  
+  # Remove rows with missing values
+  drop_na()
+
+# Check results
+dim(hospital_clean)
+table(hospital_clean$readmitted_30)
+prop.table(table(hospital_clean$readmitted_30))
+```
+
+After cleaning, the dataset contains **35,394 unique patient encounters** 
+and **25 variables**. Key cleaning steps applied:
+
+- Removed variables with excessive missingness (weight, payer_code)
+- Kept only the **first encounter per patient** to avoid data leakage
+- Removed patients discharged to hospice or who died (not at risk 
+of readmission)
+- Recoded age ranges to numeric midpoints
+- Simplified medication variables to binary
+- Created binary outcome: **readmission within 30 days**
+
+**Class distribution:**
+- Not readmitted within 30 days: 32,301 (91.3%)
+- Readmitted within 30 days: 3,093 (8.7%)
+
+The significant class imbalance reflects real clinical data — early 
+readmission is relatively rare but clinically critical.
+
+## Exploratory Data Analysis
+
+```{r eda}
+# 1. Readmission by age
+hospital_clean %>%
+  group_by(age, readmitted_30) %>%
+  summarise(n = n()) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(readmitted_30 == "Yes") %>%
+  ggplot(aes(x = age, y = pct)) +
+  geom_col(fill = "#E64B35", alpha = 0.8) +
+  geom_smooth(se = FALSE, color = "#2E9FDF") +
+  theme_minimal() +
+  labs(title = "30-Day Readmission Rate by Age",
+       x = "Age", y = "Readmission Rate")
+
+# 2. Readmission by time in hospital
+hospital_clean %>%
+  group_by(time_in_hospital, readmitted_30) %>%
+  summarise(n = n()) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(readmitted_30 == "Yes") %>%
+  ggplot(aes(x = time_in_hospital, y = pct)) +
+  geom_col(fill = "#2E9FDF", alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "30-Day Readmission Rate by Time in Hospital",
+       x = "Days in Hospital", y = "Readmission Rate")
+
+# 3. Readmission by number of diagnoses
+hospital_clean %>%
+  group_by(number_diagnoses, readmitted_30) %>%
+  summarise(n = n()) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(readmitted_30 == "Yes") %>%
+  ggplot(aes(x = number_diagnoses, y = pct)) +
+  geom_col(fill = "#00A087", alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "30-Day Readmission Rate by Number of Diagnoses",
+       x = "Number of Diagnoses", y = "Readmission Rate")
+```
+
+The exploratory analysis reveals several clinically meaningful patterns:
+
+**Age:** Readmission rates increase with age, peaking in older patients 
+(70-90 years). This is consistent with the higher disease burden and 
+complexity of care in elderly diabetic patients.
+
+**Time in hospital:** Longer hospitalizations are associated with higher 
+readmission rates, likely reflecting more severe disease episodes that 
+require continued management after discharge.
+
+**Number of diagnoses:** Patients with more diagnoses (higher comorbidity 
+burden) show substantially higher readmission rates, confirming that 
+clinical complexity is a key risk factor.
+
+## Model Training
+
+**Why Random Forest?**
+
+Random Forest was selected due to its:
+- Robustness to noisy and incomplete clinical data
+- Ability to capture non-linear relationships between variables
+- Built-in variable importance for clinical interpretability
+- Strong performance in published readmission prediction studies
+
+**Why 5-fold CV with SMOTE?**
+
+Given the extreme class imbalance (8.7% positive cases), SMOTE was 
+applied within each fold to generate synthetic minority samples without 
+data leakage. 5-fold CV provides a robust, unbiased estimate of 
+real-world performance.
+We train a Random Forest model with cross-validation and SMOTE to 
+handle the class imbalance (91.3% No vs 8.7% Yes), following the 
+best practices established in the previous projects.
+
+```{r model-training}
+# Split into training (80%) and test (20%)
+set.seed(123)
+train_index <- createDataPartition(hospital_clean$readmitted_30,
+                                   p = 0.8, list = FALSE)
+train_data <- hospital_clean[train_index, ]
+test_data <- hospital_clean[-train_index, ]
+
+cat("Training set:", nrow(train_data), "observations\n")
+cat("Test set:", nrow(test_data), "observations\n")
+
+# Define cross-validation with SMOTE
+cv_control <- trainControl(
+  method = "cv", number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  sampling = "smote"
+)
+
+# Train Random Forest
+set.seed(123)
+rf_model <- train(
+  readmitted_30 ~ .,
+  data = train_data,
+  method = "rf",
+  metric = "ROC",
+  trControl = cv_control,
+  tuneGrid = expand.grid(mtry = c(3, 5, 7)),
+  ntree = 300
+)
+
+print(rf_model)
+```
+
+The cross-validated model achieved **ROC-AUC = 0.625** with mtry = 5 
+as the optimal parameter.
+
+The results reveal the fundamental challenge of this dataset: with only 
+8.7% positive cases, the model struggles to balance sensitivity and 
+specificity. High sensitivity (99.9%) comes at the cost of near-zero 
+specificity, reflecting the extreme class imbalance.
+
+This is a common finding in real-world hospital readmission prediction 
+studies — ROC-AUC values between 0.60-0.70 are typical in the literature 
+for this type of data.
+
+## Model Evaluation
+
+We evaluate the model on the held-out test set using multiple metrics, 
+paying special attention to PR-AUC and sensitivity given the clinical 
+context — missing a high-risk patient has serious consequences.
+
+```{r model-evaluation}
+# Predictions on test set
+rf_pred <- predict(rf_model, test_data)
+rf_prob <- predict(rf_model, test_data, type = "prob")[, "Yes"]
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(rf_pred, test_data$readmitted_30,
+                                positive = "Yes")
+print(conf_matrix)
+
+# ROC-AUC
+roc_obj <- pROC::roc(test_data$readmitted_30, rf_prob)
+cat("ROC-AUC:", round(pROC::auc(roc_obj), 3), "\n")
+
+# PR-AUC
+pr_obj <- precrec::evalmod(
+  scores = rf_prob,
+  labels = ifelse(test_data$readmitted_30 == "Yes", 1, 0)
+)
+pr_aucs <- precrec::auc(pr_obj)
+cat("PR-AUC:", round(pr_aucs[pr_aucs$curvetypes == "PRC", "aucs"], 3), "\n")
+
+# F1 Score
+f1 <- MLmetrics::F1_Score(
+  y_pred = rf_pred,
+  y_true = test_data$readmitted_30,
+  positive = "Yes"
+)
+cat("F1 Score:", round(f1, 3), "\n")
+
+# ROC curve
+plot(roc_obj,
+     main = paste("ROC Curve - AUC:", round(pROC::auc(roc_obj), 3)),
+     col = "#E64B35", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "grey")
+```
+
+The model evaluation reveals the genuine difficulty of predicting 
+rare clinical events:
+
+- **ROC-AUC = 0.627:** the model shows meaningful discriminative 
+ability above random chance (0.5), consistent with published 
+literature on readmission prediction (typical range: 0.60-0.70)
+- **PR-AUC = 0.140 vs baseline 0.087:** the model identifies 
+high-risk patients at a rate 60% better than random selection
+- **Sensitivity at threshold 0.10 = ~75%:** the model successfully 
+identifies approximately 3 out of 4 high-risk patients, 
+significantly reducing the likelihood of missed readmissions
+
+These results should not be interpreted as model failure — they 
+reflect the **inherent complexity of clinical prediction** where 
+many readmissions are driven by social and environmental factors 
+not captured in administrative data.
+
+## Threshold Tuning and Variable Importance
+
+Given the extreme class imbalance, we tune the classification threshold 
+to improve sensitivity at the cost of specificity. In a clinical screening 
+context, missing a high-risk patient is more costly than a false alarm.
+
+We also examine which variables the model considers most important for 
+predicting readmission.
+
+```{r threshold-vip}
+library(vip)
+
+# Threshold tuning
+thresholds <- seq(0.05, 0.5, by = 0.05)
+
+threshold_results <- data.frame(
+  threshold = thresholds,
+  sensitivity = NA,
+  specificity = NA,
+  f1 = NA
+)
+
+for(i in seq_along(thresholds)) {
+  pred_thresh <- factor(
+    ifelse(rf_prob > thresholds[i], "Yes", "No"),
+    levels = c("No", "Yes")
+  )
+  cm <- confusionMatrix(pred_thresh, test_data$readmitted_30,
+                        positive = "Yes")
+  threshold_results$sensitivity[i] <- cm$byClass["Sensitivity"]
+  threshold_results$specificity[i] <- cm$byClass["Specificity"]
+  threshold_results$f1[i] <- MLmetrics::F1_Score(
+    y_pred = pred_thresh,
+    y_true = test_data$readmitted_30,
+    positive = "Yes"
+  )
+}
+
+# Plot threshold tuning
+threshold_results %>%
+  pivot_longer(-threshold, names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = threshold, y = value, color = metric)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("#E64B35", "#2E9FDF", "#00A087")) +
+  theme_minimal() +
+  labs(title = "Threshold Tuning",
+       x = "Threshold", y = "Value", color = "Metric")
+
+# Variable importance
+vip(rf_model,
+    num_features = 15,
+    aesthetics = list(fill = "#E64B35", alpha = 0.8)) +
+  theme_minimal() +
+  labs(title = "Variable Importance - Readmission Prediction")
+```
+
+**Feature importance analysis — critical for clinical interpretability:**
+
+The three most important predictors are:
+
+- **Gender:** male and female diabetic patients show fundamentally 
+different readmission patterns, likely reflecting differences in 
+healthcare-seeking behavior, social support and disease management
+- **Insulin:** changes in insulin dosage during hospitalization 
+directly reflect glycemic instability — the primary driver of 
+diabetic complications and readmission
+- **Medication change:** patients whose medications were not adjusted 
+during hospitalization may represent undertreated cases, leaving 
+them at higher risk after discharge
+
+👉 These findings suggest that **targeted medication review at 
+discharge**, particularly for insulin-dependent patients, could 
+reduce readmission rates.
+
+**Threshold Tuning:**
+
+At the default threshold (0.5), the model detects no readmission cases. 
+Lowering the threshold to 0.05-0.10 achieves sensitivity of ~75%, 
+though at the cost of lower specificity (~30%).
+
+In a clinical screening context, a threshold of **0.10** would be 
+recommended — identifying approximately 75% of high-risk patients 
+while maintaining acceptable false positive rates.
+
+## Conclusions
+
+This analysis demonstrates the challenges and opportunities of predicting 
+30-day hospital readmission in diabetic patients using real-world 
+clinical data.
+
+**Key findings:**
+
+1. After cleaning 101,766 hospital records, **35,394 unique patient 
+encounters** were retained for analysis. The cleaning process addressed 
+duplicate patients, deceased/hospice cases, and missing values — 
+reflecting the complexity of real hospital data.
+
+2. The dataset shows extreme class imbalance (**8.7% readmission rate**), 
+consistent with real clinical data. This makes prediction genuinely 
+difficult and highlights the importance of appropriate evaluation metrics.
+
+3. The Random Forest model achieved **ROC-AUC = 0.627**, consistent 
+with published literature on hospital readmission prediction (typical 
+range: 0.60-0.70). This moderate performance reflects the inherent 
+difficulty of predicting complex clinical outcomes.
+
+4. **Gender, insulin management and medication changes** were identified 
+as the strongest predictors of readmission, consistent with clinical 
+knowledge about diabetes management.
+
+5. **Threshold tuning** revealed that a threshold of 0.10 achieves 
+~75% sensitivity — clinically preferable for screening despite lower 
+specificity.
+
+**Business and clinical impact:**
+
+In the United States, hospitals with high readmission rates face 
+financial penalties from CMS. With approximately **35,000 diabetic 
+patients** in this dataset:
+
+- The model identifies ~75% of high-risk patients at a threshold of 0.10
+- This represents approximately **2,300 patients** who could receive 
+targeted interventions
+- Even a **10% reduction in readmissions** would translate into 
+significant cost savings and improved patient outcomes
+
+This demonstrates how predictive models can directly support 
+**clinical decision-making and hospital resource allocation**.
+
+**Clinical implications:**
+
+This model could serve as a **preliminary screening tool** to flag 
+high-risk patients before discharge, enabling targeted interventions 
+such as:
+- Enhanced discharge planning
+- Earlier follow-up appointments
+- Medication reconciliation
+- Patient education programs
+
+**Limitations:**
+
+- Moderate predictive performance (ROC-AUC = 0.627) limits clinical utility
+- Important predictors like HbA1c trends and social determinants 
+of health were not available
+- Model requires external validation before clinical deployment
+- Class imbalance remains a major challenge despite SMOTE
+
+**Future directions:**
+
+- Incorporate additional clinical variables (HbA1c trajectory, 
+social support, medication adherence)
+- Explore gradient boosting methods (XGBoost, LightGBM)
+- Apply cost-sensitive learning with explicit readmission costs
+- Validate on an independent hospital dataset
+- Develop a Shiny dashboard for clinical use
