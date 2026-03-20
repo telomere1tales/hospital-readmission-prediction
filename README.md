@@ -2,11 +2,6 @@ Aquí tienes el README mejorado combinando ambos:
 markdown# 🏥 Hospital Readmission Prediction — Diabetes Patients
 ## Machine Learning for Healthcare Risk Stratification
 
-## 🔗 Key Links
-- 📄 **[Full Report](hospital_readmission.html)**
-
----
-
 ## 📌 Overview
 
 Hospital readmissions are a major challenge in healthcare systems, 
